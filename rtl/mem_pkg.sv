@@ -1,169 +1,219 @@
-// mem_pkg.sv -- shared parameters, types and address helpers for the memory subsystem
-// rv32_ooo_pkg.sv must be compiled before this file.
-
 package mem_pkg;
 
     import rv32_ooo_pkg::*;
 
-    // -----------------------------------------------------------------------
-    // Knobs: L1 1 KiB, L2 4 KiB, 4-way, 32-byte lines
-    // -----------------------------------------------------------------------
+    // Cache geometry
+    localparam int unsigned WORD_BYTES     = 4;
     localparam int unsigned LINE_BYTES     = 32;
-    localparam int unsigned WORD_BYTES     = XLEN / 8;          // 4
+    localparam int unsigned WORDS_PER_LINE = LINE_BYTES / WORD_BYTES; // 8 words
+    localparam int unsigned BYTE_OFF_W     = 2;
+    localparam int unsigned WORD_OFF_W     = 3;                       // log2(8)
+    localparam int unsigned LINE_OFF_W     = BYTE_OFF_W + WORD_OFF_W; // 5
+    localparam int unsigned LINE_ADDR_W    = XLEN - LINE_OFF_W;       // 27 bit line address
 
-    localparam int unsigned L1_SIZE_BYTES  = 1024;
-    localparam int unsigned L1_WAYS        = 4;
+    // L1: 1 KiB, 32 B, 4 ways
+    localparam int unsigned L1_BYTES   = 1024;
+    localparam int unsigned L1_WAYS    = 4;
+    localparam int unsigned L1_SETS    = 8;
+    localparam int unsigned L1_INDEX_W = 3;
+    localparam int unsigned L1_TAG_W   = LINE_ADDR_W - L1_INDEX_W; // 24 bit tag
 
-    localparam int unsigned L2_SIZE_BYTES  = 4096;
-    localparam int unsigned L2_WAYS        = 4;
+    // L2: 4 KiB, 32 B, 4 ways
+    localparam int unsigned L2_BYTES   = 4096;
+    localparam int unsigned L2_WAYS    = 4;
+    localparam int unsigned L2_SETS    = 32;
+    localparam int unsigned L2_INDEX_W = 5;
+    localparam int unsigned L2_TAG_W   = LINE_ADDR_W - L2_INDEX_W; // 22 bit tag
+    localparam int unsigned WAY_W      = 2; //2 bits to select 1 of 4 ways
 
-    // BIP: insert at MRU once every BIP_THROTTLE fills, otherwise at LRU
-    localparam int unsigned BIP_THROTTLE   = 32;
+    // LSQ
+    localparam int unsigned LSQ_DEPTH  = 8; // 8-entry
+    localparam int unsigned LSQ_IDX_W  = 3; // eight queue entry index, 0-7
+    localparam int unsigned LSQ_CNT_W  = 4; // occupancy ranges from 0-8
 
-    // -----------------------------------------------------------------------
-    // do not edit, change the knobs instead
-    // -----------------------------------------------------------------------
-    localparam int unsigned WORDS_PER_LINE = LINE_BYTES / WORD_BYTES;           // 32 / 4 = 8
+    // BIP
+    localparam int unsigned BIP_PERIOD = 32; // one-in-32 MRU insertion policy
+    localparam int unsigned BIP_CNT_W  = 5;  // 32 counter states
 
-    localparam int unsigned BYTE_OFF_W     = $clog2(WORD_BYTES);                // $clog2(4) = 2
-    localparam int unsigned WORD_OFF_W     = $clog2(WORDS_PER_LINE);            // 3
-    localparam int unsigned LINE_OFF_W     = BYTE_OFF_W + WORD_OFF_W;           // 5
+    // Data types
+    typedef logic [XLEN-1:0]                     word_t;
+    typedef logic [WORD_BYTES-1:0]               byte_en_t;
+    typedef logic [LINE_ADDR_W-1:0]              line_addr_t; // addr[31:5], removes line offset
+    typedef logic [WORDS_PER_LINE-1:0][XLEN-1:0] line_data_t; // [word][bit]
+    typedef logic [WORD_OFF_W-1:0]               word_off_t; // selects word, 0-7
+    typedef logic [WAY_W-1:0]                    way_t; // selects way, 0-3
 
-    localparam int unsigned L1_SETS        = L1_SIZE_BYTES / (LINE_BYTES * L1_WAYS);  // 8
-    localparam int unsigned L1_INDEX_W     = $clog2(L1_SETS);                         // 3
-    localparam int unsigned L1_TAG_W       = XLEN - L1_INDEX_W - LINE_OFF_W;          // 24
-    localparam int unsigned L1_WAY_W       = $clog2(L1_WAYS);                         // 2
+    typedef logic [L1_INDEX_W-1:0]               l1_index_t;
+    typedef logic [L1_TAG_W-1:0]                 l1_tag_t;
+    typedef logic [L2_INDEX_W-1:0]               l2_index_t;
+    typedef logic [L2_TAG_W-1:0]                 l2_tag_t;
 
-    localparam int unsigned L2_SETS        = L2_SIZE_BYTES / (LINE_BYTES * L2_WAYS);  // 32
-    localparam int unsigned L2_INDEX_W     = $clog2(L2_SETS);                         // 5
-    localparam int unsigned L2_TAG_W       = XLEN - L2_INDEX_W - LINE_OFF_W;          // 22
-    localparam int unsigned L2_WAY_W       = $clog2(L2_WAYS);                         // 2
+    // L2 replacement metadata: one 2-bit rank per way, ranks 0, 1 , 2 ,3 where 0 = MRU, 3 = LRU
+    typedef logic [1:0]                          lru_rank_t; // rank of 1 way
+    typedef logic [L2_WAYS-1:0][1:0]             lru_ranks_t; // all 4 ranks
 
-    localparam int unsigned PLRU_BITS      = L1_WAYS - 1;                             // 3
-    localparam int unsigned BIP_CTR_W      = $clog2(BIP_THROTTLE);                    // 5
-
-
-    // -----------------------------------------------------------------------
-    // Basic types
-    // -----------------------------------------------------------------------
-    typedef logic [XLEN-1:0]                         addr_t;
-    typedef logic [XLEN-1:0]                         word_t;
-    typedef logic [WORD_BYTES-1:0]                   byte_en_t;
-    typedef logic [WORDS_PER_LINE-1:0][XLEN-1:0]     line_data_t;   // [word][bit]
-
-    typedef logic [BYTE_OFF_W-1:0]                   byte_off_t;
-    typedef logic [WORD_OFF_W-1:0]                   word_off_t;
-
-    typedef logic [L1_TAG_W-1:0]                     l1_tag_t;
-    typedef logic [L1_INDEX_W-1:0]                   l1_index_t;
-    typedef logic [L1_WAY_W-1:0]                     l1_way_t;
-
-    typedef logic [L2_TAG_W-1:0]                     l2_tag_t;
-    typedef logic [L2_INDEX_W-1:0]                   l2_index_t;
-    typedef logic [L2_WAY_W-1:0]                     l2_way_t;
-
-    // Replacement state
-    typedef logic [PLRU_BITS-1:0]                    plru_bits_t;   // one per L1 set
-    typedef logic [L2_WAY_W-1:0]                     lru_rank_t;    // 0 = MRU ... WAYS-1 = LRU (team to confirm)
-    typedef logic [L2_WAYS-1:0][L2_WAY_W-1:0]        l2_set_ranks_t;// one rank per way, one per L2 set
-    typedef logic [BIP_CTR_W-1:0]                    bip_ctr_t;
-
-
-    // -----------------------------------------------------------------------
-    // Per-line metadata (tag array entry)
-    // -----------------------------------------------------------------------
+    // L1 <-> L2 line-transfer protocol
     typedef struct packed {
-        logic    valid;
-        logic    dirty;
-        l1_tag_t tag;
-    } l1_meta_t;
+        line_addr_t fetch_line; 
+        logic       victim_valid; 
+        logic       victim_dirty; 
+        line_addr_t victim_line; 
+        line_data_t victim_data; 
+    } l1_l2_req_t;
 
     typedef struct packed {
-        logic    valid;
-        logic    dirty;
-        l2_tag_t tag;
-    } l2_meta_t;
+        line_data_t data; // line returned from L2
+        logic       dirty; // preserve dirty status during promotion
+        logic       error; // any main-memory error seen during the refill (transfer error)
+    } l2_l1_resp_t;
 
 
-    // -----------------------------------------------------------------------
-    // A whole line moving between levels (promotion, demotion, refill,
-    // writeback). The address is the line-aligned base address, so it is
-    // level-independent: each level re-splits it with its own helpers below.
-    // The dirty bit MUST travel with the line in the exclusive hierarchy.
-    // -----------------------------------------------------------------------
-    typedef struct packed {
-        addr_t      base;
-        logic       dirty;
-        line_data_t data;
-    } line_t;
-
-
-    // -----------------------------------------------------------------------
-    // L1 -> L2 command
-    //   L2_CMD_FETCH  : L1 missed. L2 returns the line. On an L2 hit the L2
-    //                   copy is invalidated (exclusive). On an L2 miss the
-    //                   line is fetched from main memory and passed straight
-    //                   to L1 without being installed in L2.
-    //   L2_CMD_VICTIM : L1 evicted a valid line. L2 installs it (data + dirty),
-    //                   evicting / writing back its own victim if needed.
-    // -----------------------------------------------------------------------
-    typedef enum logic [1:0] {
-        L2_CMD_NONE,
-        L2_CMD_FETCH,
-        L2_CMD_VICTIM
-    } l2_cmd_e;
-
-
-    // -----------------------------------------------------------------------
     // Address helpers
-    // -----------------------------------------------------------------------
-    function automatic byte_off_t byte_offset(input addr_t a);
-        return a[0 +: BYTE_OFF_W];
+    // remove lower 5 offset bits to get cache line addr
+    function automatic line_addr_t line_of(input word_t addr);
+        return addr[XLEN-1:LINE_OFF_W];
     endfunction
 
-    function automatic word_off_t word_offset(input addr_t a);
-        return a[BYTE_OFF_W +: WORD_OFF_W];
+    // select 1 of 8 words within a cache line
+    function automatic word_off_t word_of(input word_t addr);
+        return addr[LINE_OFF_W-1:BYTE_OFF_W];
     endfunction
 
-    // Clear the offset bits -> address of the first byte in the line
-    function automatic addr_t line_base(input addr_t a);
-        return {a[XLEN-1:LINE_OFF_W], {LINE_OFF_W{1'b0}}};
+    // convert line addr back to byte addr
+    function automatic word_t line_base(input line_addr_t line);
+        return {line, {LINE_OFF_W{1'b0}}};
     endfunction
 
-    // Byte address of word w inside the line starting at base
-    // (used to step through the 8 beats of a refill / writeback)
-    function automatic addr_t word_addr(input addr_t base, input word_off_t w);
-        return {base[XLEN-1:LINE_OFF_W], w, {BYTE_OFF_W{1'b0}}};
+    // extract L1 set index and tag
+    function automatic l1_index_t l1_index(input line_addr_t line);
+        return line[L1_INDEX_W-1:0];
     endfunction
 
-    // ----- L1 split -----
-    function automatic l1_index_t l1_index(input addr_t a);
-        return a[LINE_OFF_W +: L1_INDEX_W];
+    function automatic l1_tag_t l1_tag(input line_addr_t line);
+        return line[LINE_ADDR_W-1:L1_INDEX_W];
     endfunction
 
-    function automatic l1_tag_t l1_tag(input addr_t a);
-        return a[XLEN-1 -: L1_TAG_W];
+    // extract L2 set index and tag
+    function automatic l2_index_t l2_index(input line_addr_t line);
+        return line[L2_INDEX_W-1:0];
     endfunction
 
-    // Rebuild a line base address from what the L1 tag array stores
-    // (needed when an L1 victim is sent down to L2)
-    function automatic addr_t l1_line_addr(input l1_tag_t t, input l1_index_t i);
-        return {t, i, {LINE_OFF_W{1'b0}}};
+    function automatic l2_tag_t l2_tag(input line_addr_t line);
+        return line[LINE_ADDR_W-1:L2_INDEX_W];
     endfunction
 
-    // ----- L2 split -----
-    function automatic l2_index_t l2_index(input addr_t a);
-        return a[LINE_OFF_W +: L2_INDEX_W];
+    // merge store data with old word, only update enabled bytes 
+    function automatic word_t merge_bytes(input word_t    old_word,
+                                          input word_t    new_word,
+                                          input byte_en_t be);
+        word_t r;
+        for (int b = 0; b < WORD_BYTES; b++)
+            r[8*b +: 8] = be[b] ? new_word[8*b +: 8] : old_word[8*b +: 8];
+        return r;
     endfunction
 
-    function automatic l2_tag_t l2_tag(input addr_t a);
-        return a[XLEN-1 -: L2_TAG_W];
+
+    // LSU helpers
+    // generate 4-bit byte mask based on access size and offset
+    function automatic byte_en_t make_byte_enable(input mem_size_e  size,
+                                                  input logic [1:0] off);
+        case (size)
+            MEM_BYTE: return byte_en_t'(4'b0001 << off);
+            MEM_HALF: return byte_en_t'(4'b0011 << off);
+            default:  return 4'b1111;
+        endcase
     endfunction
 
-    // Rebuild a line base address from the L2 tag array
-    // (when a dirty L2 victim is written back to main memory)
-    function automatic addr_t l2_line_addr(input l2_tag_t t, input l2_index_t i);
-        return {t, i, {LINE_OFF_W{1'b0}}};
+    // replicate store data across the 32 bit word, byte enable determines which bytes are actually written
+    function automatic word_t align_store_data(input mem_size_e size,
+                                               input word_t     rs2);
+        case (size)
+            MEM_BYTE: return {4{rs2[7:0]}};  // repeat 8 bit value 4 tiems
+            MEM_HALF: return {2{rs2[15:0]}}; // repeat 16-bit value twice
+            default:  return rs2;            // full 32-bit word
+        endcase
+    endfunction
+
+    // extract requested load bytes and sign/zero extend to 32 bits
+    function automatic word_t extract_load(input word_t      raw,
+                                           input mem_size_e  size,
+                                           input logic [1:0] off,
+                                           input logic       is_unsigned);
+        word_t sh;
+        sh = raw >> (8 * off);
+        case (size)
+            MEM_BYTE: return is_unsigned ? {24'b0, sh[7:0]}
+                                         : {{24{sh[7]}}, sh[7:0]};
+            MEM_HALF: return is_unsigned ? {16'b0, sh[15:0]}
+                                         : {{16{sh[15]}}, sh[15:0]};
+            default:  return raw;
+        endcase
+    endfunction
+
+    // check whether halfword/word access is misaligned
+    function automatic logic is_misaligned(input mem_size_e  size,
+                                           input logic [1:0] off);
+        case (size)
+            MEM_HALF: return off[0];         // halfword needs even address
+            MEM_WORD: return (off != 2'b00); // word needs 4-byte alignment
+            default:  return 1'b0;           // byte can use any offset
+        endcase
+    endfunction
+
+
+    // L2 BIP / LRU rank helpers  (0 = MRU, 3 = LRU)
+    function automatic lru_ranks_t lru_reset_ranks();
+        lru_ranks_t r;
+        for (int i = 0; i < L2_WAYS; i++) r[i] = lru_rank_t'(i);
+        return r;
+    endfunction
+
+    // move selected way to MRU (rank 0), other more-recent ways shift one rank toward LRU
+    function automatic lru_ranks_t lru_touch_mru(input lru_ranks_t r,
+                                                 input way_t       w);
+        lru_ranks_t n;
+        lru_rank_t  old;
+        old = r[w];
+        for (int i = 0; i < L2_WAYS; i++) begin
+            if (way_t'(i) == w)  n[i] = 2'd0;
+            else if (r[i] < old) n[i] = r[i] + 2'd1;
+            else                 n[i] = r[i];
+        end
+        return n;
+    endfunction
+
+    // insert selected way at LRU (rank 3), more-recent ranks shift toward MRU
+    function automatic lru_ranks_t lru_insert_lru(input lru_ranks_t r,
+                                                  input way_t       w);
+        lru_ranks_t n;
+        lru_rank_t  old;
+        old = r[w];
+        for (int i = 0; i < L2_WAYS; i++) begin
+            if (way_t'(i) == w)  n[i] = 2'd3;
+            else if (r[i] > old) n[i] = r[i] - 2'd1;
+            else                 n[i] = r[i];
+        end
+        return n;
+    endfunction
+
+    // choose invalid way first, otherwise evict rank 3 (LRU)
+    function automatic way_t lru_victim(input lru_ranks_t           r,
+                                        input logic [L2_WAYS-1:0]   valid);
+        way_t w;
+        logic found;
+        w     = '0;
+        found = 1'b0;
+        for (int i = 0; i < L2_WAYS; i++) begin
+            if (!valid[i] && !found) begin
+                w     = way_t'(i);
+                found = 1'b1;
+            end
+        end
+        if (!found) begin
+            for (int i = 0; i < L2_WAYS; i++)
+                if (r[i] == 2'd3) w = way_t'(i);
+        end
+        return w;
     endfunction
 
 endpackage
