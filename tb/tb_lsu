@@ -1,0 +1,296 @@
+// self-checking testbench for lsu
+
+module tb_lsu;
+
+    import rv32_ooo_pkg::*;
+    import mem_pkg::*;
+
+    logic clk = 0, rst_n = 0;
+    always #5 clk = ~clk;
+
+    // DUT 
+    backend_memory_if be ();
+    data_memory_if    dmem ();
+    logic             misaligned;
+
+    lsu dut (.clk_i(clk), .rst_ni(rst_n), .be_if(be), .dmem_if(dmem), .misaligned_o(misaligned));
+
+    // memories
+    localparam int WORDS = 4096;                 // 16 KiB
+    logic [31:0] mem     [WORDS];                // main memory model
+    logic [31:0] ref_mem [WORDS];                // correct value of every word
+
+    int errors = 0, completed = 0;
+
+    function automatic logic [31:0] start_value(input int i);
+        return i * 32'h9E37_79B1;
+    endfunction
+
+    //simple main memory
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            dmem.request_ready  <= 1'b1;
+            dmem.response_valid <= 1'b0;
+            dmem.error          <= 1'b0;
+        end else begin
+            if (dmem.request_valid && dmem.request_ready) begin
+                if (dmem.write) begin
+                    for (int b = 0; b < 4; b++)
+                        if (dmem.byte_enable[b]) mem[dmem.address >> 2][8*b +: 8] = dmem.write_data[8*b +: 8];
+                end else begin
+                    dmem.read_data <= mem[dmem.address >> 2];
+                end
+                dmem.request_ready  <= 1'b0;
+                dmem.response_valid <= 1'b1;
+            end
+            if (dmem.response_valid && dmem.response_ready) begin
+                dmem.response_valid <= 1'b0;
+                dmem.request_ready  <= 1'b1;
+            end
+        end
+    end
+
+    //indexed by the 6-bit ROB tag
+    bit          waiting  [64];                  // issued, result not back yet
+    bit          is_load  [64];
+    logic [31:0] expected [64];
+    phys_reg_t   dest     [64];
+    rob_tag_t    next_tag = '0;                  // tag for the next instruction
+    rob_tag_t    head     = '0;                  // oldest unfinished instruction
+    bit          result_ready_en = 1;
+
+    function automatic int T(input rob_tag_t t);
+        return int'(flatten_rob_tag(t));
+    endfunction
+
+    function automatic void advance_head();
+        while (head != next_tag && !waiting[T(head)]) head = increment_rob_tag(head, 2'd1);
+    endfunction
+
+    always @(negedge clk) begin
+        be.rob_head_tag = head;
+        be.result_ready = result_ready_en;
+    end
+
+    // check every result the LSU returns
+    always @(posedge clk) begin
+        if (rst_n && be.result_valid && be.result_ready) begin
+            int t;
+            t = T(be.result.rob_tag);
+            if (!waiting[t]) begin
+                errors++;
+                $display("ERROR: result for ROB tag %0d, which is not waiting for one", t);
+            end else begin
+                if (is_load[t]) begin
+                    if (be.result.value !== expected[t]) begin
+                        errors++;
+                        $display("ERROR: load (tag %0d) returned %h, expected %h", t, be.result.value, expected[t]);
+                    end
+                    if (!be.result.writeback_valid || be.result.writeback_pdst !== dest[t]) begin
+                        errors++;
+                        $display("ERROR: load (tag %0d) has wrong writeback_valid/pdst", t);
+                    end
+                end else if (be.result.writeback_valid) begin
+                    errors++;
+                    $display("ERROR: store (tag %0d) has writeback_valid=1", t);
+                end
+                waiting[t] = 0;
+                completed++;
+                advance_head();
+            end
+        end
+    end
+
+    // reference load 
+    function automatic logic [31:0] load_value(input logic [31:0] w, input mem_size_e size,
+                                               input int off, input bit uns);
+        logic [31:0] s;
+        s = w >> (8 * off);
+        case (size)
+            MEM_BYTE: return uns ? {24'h0, s[7:0]}  : {{24{s[7]}},  s[7:0]};
+            MEM_HALF: return uns ? {16'h0, s[15:0]} : {{16{s[15]}}, s[15:0]};
+            default:  return w;
+        endcase
+    endfunction
+
+    // issue one load or store 
+    task automatic issue(input bit store, input mem_size_e size, input bit uns,
+                         input logic [31:0] addr, input logic [31:0] data = 0);
+        renamed_uop_t u;
+        int t, idx, off;
+
+        while (rob_tag_distance(next_tag, head) >= ROB_ENTRY_COUNT) @(negedge clk);   // ROB full
+
+        t   = T(next_tag);
+        idx = addr >> 2;
+        off = addr[1:0];
+
+        // reference model, in program order
+        if (store) begin
+            case (size)
+                MEM_BYTE: ref_mem[idx][8*off +: 8]  = data[7:0];
+                MEM_HALF: ref_mem[idx][8*off +: 16] = data[15:0];
+                default:  ref_mem[idx]              = data;
+            endcase
+        end else begin
+            expected[t] = load_value(ref_mem[idx], size, off, uns);
+        end
+        waiting[t] = 1;
+        is_load[t] = !store;
+        dest[t]    = phys_reg_t'($urandom());
+
+        u = '0;
+        u.decoded.mem_cmd       = store ? MEM_STORE : MEM_LOAD;
+        u.decoded.mem_size      = size;
+        u.decoded.load_unsigned = uns;
+        u.decoded.immediate     = 32'd16;            // address = source_1 + 16
+        u.rob_tag               = next_tag;
+        u.pdst                  = dest[t];
+        u.has_destination       = !store;
+        next_tag = increment_rob_tag(next_tag, 2'd1);
+
+        @(negedge clk);
+        be.issue_valid = 1;
+        be.issue_uop   = u;
+        be.source_1    = addr - 16;
+        be.source_2    = data;
+        do @(posedge clk); while (!be.issue_ready);
+        @(negedge clk);
+        be.issue_valid = 0;
+    endtask
+
+    // every load variant at one word
+    task automatic all_loads(input logic [31:0] a);
+        for (int o = 0; o < 4; o++)     begin issue(0, MEM_BYTE, 0, a + o); issue(0, MEM_BYTE, 1, a + o); end
+        for (int o = 0; o < 4; o += 2)  begin issue(0, MEM_HALF, 0, a + o); issue(0, MEM_HALF, 1, a + o); end
+        issue(0, MEM_WORD, 0, a);
+    endtask
+
+    task automatic wait_all();
+        while (head != next_tag) @(posedge clk);
+        repeat (2) @(posedge clk);
+    endtask
+
+    // if older non-memory instruction is still at the ROB head
+    task automatic block_rob_head(output rob_tag_t t);
+        t = next_tag;
+        waiting[T(t)] = 1;
+        is_load[T(t)] = 0;
+        next_tag = increment_rob_tag(next_tag, 2'd1);
+    endtask
+
+    task automatic unblock_rob_head(input rob_tag_t t);
+        @(negedge clk);
+        waiting[T(t)] = 0;
+        advance_head();
+    endtask
+
+    // tests
+    rob_tag_t blocker;
+    int       c0;
+    int       sz;
+    logic [31:0] a;
+
+    initial begin
+        for (int i = 0; i < WORDS; i++) begin
+            mem[i]     = start_value(i);
+            ref_mem[i] = start_value(i);
+        end
+        be.issue_valid = 0;
+        be.issue_uop   = '0;
+        be.source_1    = 0;
+        be.source_2    = 0;
+        repeat (3) @(posedge clk);
+        @(negedge clk) rst_n = 1;
+
+        // 1. every load size/sign, before and after stores of every size
+        $display("Test 1: byte / half / word loads and stores");
+        all_loads(32'h100);
+        for (int o = 0; o < 4; o++)    issue(1, MEM_BYTE, 0, 32'h200 + o, 32'h80 + o);
+        for (int o = 0; o < 4; o += 2) issue(1, MEM_HALF, 0, 32'h210 + o, 32'h8001 + o);
+        issue(1, MEM_WORD, 0, 32'h220, 32'hDEAD_BEEF);
+        all_loads(32'h200);
+        all_loads(32'h210);
+        all_loads(32'h220);
+        wait_all();
+
+        // 2. store waiting for the ROB head. same-address loads must be forwarded, unrelated load must go ahead
+        $display("Test 2: forwarding while a store waits for the ROB head");
+        block_rob_head(blocker);
+        issue(1, MEM_WORD, 0, 32'h300, 32'hCAFE_F00D);
+        c0 = completed;
+        issue(0, MEM_WORD, 0, 32'h300);              // forwarded word
+        issue(0, MEM_BYTE, 1, 32'h303);              // forwarded byte
+        issue(0, MEM_WORD, 0, 32'h400);              // different address
+        repeat (50) @(posedge clk);
+        if (completed - c0 != 3) begin
+            errors++;
+            $display("ERROR: only %0d of 3 loads finished while the older store was blocked", completed - c0);
+        end
+        if (mem[32'h300 >> 2] === 32'hCAFE_F00D) begin
+            errors++;
+            $display("ERROR: store was written to memory before it reached the ROB head");
+        end
+        unblock_rob_head(blocker);
+        wait_all();
+
+        // 3. two older stores to one address- the load gets the younger one
+        $display("Test 3: youngest older store wins");
+        block_rob_head(blocker);
+        issue(1, MEM_WORD, 0, 32'h500, 32'h1111_1111);
+        issue(1, MEM_WORD, 0, 32'h500, 32'h2222_2222);
+        issue(0, MEM_WORD, 0, 32'h500);              // expects 2222_2222
+        issue(1, MEM_BYTE, 0, 32'h501, 32'h0000_00EE);
+        issue(0, MEM_WORD, 0, 32'h500);              // partial overlap: expects 2222_EE22
+        unblock_rob_head(blocker);
+        wait_all();
+
+        // 4. LSQ full- with results held back, the 9th op must not be accepted
+        $display("Test 4: LSQ full");
+        result_ready_en = 0;
+        for (int i = 0; i < LSQ_DEPTH; i++) issue(0, MEM_WORD, 0, 32'h600 + 4*i);
+        repeat (5) @(posedge clk);
+        if (be.issue_ready !== 1'b0) begin
+            errors++;
+            $display("ERROR: issue_ready is still high with %0d ops in the LSQ", LSQ_DEPTH);
+        end
+        result_ready_en = 1;
+        wait_all();
+
+        // 5. random loads/stores on 8 words (same-address traffic)
+        $display("Test 5: 1000 random ops");
+        for (int n = 0; n < 1000; n++) begin
+            sz = $urandom_range(2);
+            a  = 32'h700 + 4 * $urandom_range(7);
+            if (sz == 0) a += $urandom_range(3);          // byte: any offset
+            if (sz == 1) a += 2 * $urandom_range(1);      // half: offset 0 or 2
+            issue($urandom_range(1), mem_size_e'(sz), $urandom_range(1), a, $urandom());
+        end
+        wait_all();
+
+        // 6. memory must hold exactly what the program wrote
+        $display("Test 6: final memory contents");
+        for (int i = 0; i < WORDS; i++)
+            if (mem[i] !== ref_mem[i]) begin
+                errors++;
+                $display("ERROR: memory word %h = %h, expected %h", i * 4, mem[i], ref_mem[i]);
+            end
+
+        if (misaligned !== 1'b0) begin
+            errors++;
+            $display("ERROR: misaligned_o is set but every access was aligned");
+        end
+
+        $display("ops completed=%0d", completed);
+        if (errors == 0) $display("*** PASS: tb_lsu ***");
+        else             $display("*** FAIL: tb_lsu (%0d errors) ***", errors);
+        $finish;
+    end
+
+    initial begin
+        #2_000_000;
+        $display("*** FAIL: tb_lsu (timeout - DUT stopped responding) ***");
+        $finish;
+    end
+
+endmodule
